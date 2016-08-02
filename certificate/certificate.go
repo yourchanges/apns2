@@ -4,6 +4,8 @@ package certificate
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -16,11 +18,11 @@ import (
 
 // Possible errors when parsing a certificate.
 var (
-	ErrFailedToDecryptKey           = errors.New("failed to decrypt private key")
-	ErrFailedToParsePKCS1PrivateKey = errors.New("failed to parse PKCS1 private key")
-	ErrFailedToParseCertificate     = errors.New("failed to parse certificate PEM data")
 	ErrNoPrivateKey                 = errors.New("no private key")
 	ErrNoCertificate                = errors.New("no certificate")
+	ErrFailedToDecryptKey           = errors.New("failed to decrypt private key")
+	ErrFailedToParsePKCS1PrivateKey = errors.New("failed to parse PKCS1 private key")
+	ErrUnknownPrivateKeyType        = errors.New("unknown private key type in PKCS#8 wrapping")
 )
 
 // FromP12File loads a PKCS#12 certificate from a local file and returns a
@@ -119,10 +121,17 @@ func unencryptPrivateKey(block *pem.Block, password string) (crypto.PrivateKey, 
 	return parsePrivateKey(block.Bytes)
 }
 
-func parsePrivateKey(bytes []byte) (crypto.PrivateKey, error) {
-	key, err := x509.ParsePKCS1PrivateKey(bytes)
-	if err != nil {
-		return nil, ErrFailedToParsePKCS1PrivateKey
+func parsePrivateKey(der []byte) (crypto.PrivateKey, error) {
+	if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return key, nil
 	}
-	return key, nil
+	if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		switch key := key.(type) {
+		case *rsa.PrivateKey, *ecdsa.PrivateKey:
+			return key, nil
+		default:
+			return nil, ErrUnknownPrivateKeyType
+		}
+	}
+	return nil, ErrFailedToParsePKCS1PrivateKey
 }
