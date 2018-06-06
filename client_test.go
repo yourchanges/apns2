@@ -1,6 +1,9 @@
 package apns2_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"io/ioutil"
@@ -15,6 +18,7 @@ import (
 
 	apns "github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/certificate"
+	"github.com/sideshow/apns2/token"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -27,12 +31,27 @@ func mockNotification() *apns.Notification {
 	return n
 }
 
+func mockToken() *token.Token {
+	pubkeyCurve := elliptic.P256()
+	authKey, _ := ecdsa.GenerateKey(pubkeyCurve, rand.Reader)
+	return &token.Token{AuthKey: authKey}
+}
+
 func mockCert() tls.Certificate {
 	return tls.Certificate{}
 }
 
 func mockClient(url string) *apns.Client {
 	return &apns.Client{Host: url, HTTPClient: http.DefaultClient}
+}
+
+type mockTransport struct {
+	*http2.Transport
+	closed bool
+}
+
+func (c *mockTransport) CloseIdleConnections() {
+	c.closed = true
 }
 
 // Unit Tests
@@ -42,13 +61,28 @@ func TestClientDefaultHost(t *testing.T) {
 	assert.Equal(t, "https://api.development.push.apple.com", client.Host)
 }
 
+func TestTokenDefaultHost(t *testing.T) {
+	client := apns.NewTokenClient(mockToken()).Development()
+	assert.Equal(t, "https://api.development.push.apple.com", client.Host)
+}
+
 func TestClientDevelopmentHost(t *testing.T) {
 	client := apns.NewClient(mockCert()).Development()
 	assert.Equal(t, "https://api.development.push.apple.com", client.Host)
 }
 
+func TestTokenClientDevelopmentHost(t *testing.T) {
+	client := apns.NewTokenClient(mockToken()).Development()
+	assert.Equal(t, "https://api.development.push.apple.com", client.Host)
+}
+
 func TestClientProductionHost(t *testing.T) {
 	client := apns.NewClient(mockCert()).Production()
+	assert.Equal(t, "https://api.push.apple.com", client.Host)
+}
+
+func TestTokenClientProductionHost(t *testing.T) {
+	client := apns.NewTokenClient(mockToken()).Production()
 	assert.Equal(t, "https://api.push.apple.com", client.Host)
 }
 
@@ -69,8 +103,8 @@ func TestClientBadTransportError(t *testing.T) {
 }
 
 func TestClientNameToCertificate(t *testing.T) {
-	certificate, _ := certificate.FromP12File("certificate/_fixtures/certificate-valid.p12", "")
-	client := apns.NewClient(certificate)
+	crt, _ := certificate.FromP12File("certificate/_fixtures/certificate-valid.p12", "")
+	client := apns.NewClient(crt)
 	name := client.HTTPClient.Transport.(*http2.Transport).TLSClientConfig.NameToCertificate
 	assert.Len(t, name, 1)
 
@@ -81,9 +115,9 @@ func TestClientNameToCertificate(t *testing.T) {
 }
 
 func TestDialTLSTimeout(t *testing.T) {
-	apns.TLSDialTimeout = 1 * time.Millisecond
-	certificate, _ := certificate.FromP12File("certificate/_fixtures/certificate-valid.p12", "")
-	client := apns.NewClient(certificate)
+	apns.TLSDialTimeout = 10 * time.Millisecond
+	crt, _ := certificate.FromP12File("certificate/_fixtures/certificate-valid.p12", "")
+	client := apns.NewClient(crt)
 	dialTLS := client.HTTPClient.Transport.(*http2.Transport).DialTLS
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -133,7 +167,6 @@ func TestHeaders(t *testing.T) {
 	n := mockNotification()
 	n.ApnsID = "84DB694F-464F-49BD-960A-D6DB028335C9"
 	n.CollapseID = "game1.start.identifier"
-	n.ThreadID = "game1.thread.1"
 	n.Topic = "com.testapp"
 	n.Priority = 10
 	n.Expiration = time.Now()
@@ -141,12 +174,26 @@ func TestHeaders(t *testing.T) {
 		assert.Equal(t, n.ApnsID, r.Header.Get("apns-id"))
 		assert.Equal(t, n.CollapseID, r.Header.Get("apns-collapse-id"))
 		assert.Equal(t, "10", r.Header.Get("apns-priority"))
-		assert.Equal(t, n.ThreadID, r.Header.Get("thread-id"))
 		assert.Equal(t, n.Topic, r.Header.Get("apns-topic"))
 		assert.Equal(t, fmt.Sprintf("%v", n.Expiration.Unix()), r.Header.Get("apns-expiration"))
 	}))
 	defer server.Close()
 	_, err := mockClient(server.URL).Push(n)
+	assert.NoError(t, err)
+}
+
+func TestAuthorizationHeader(t *testing.T) {
+	n := mockNotification()
+	token := mockToken()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "application/json; charset=utf-8", r.Header.Get("Content-Type"))
+		assert.Equal(t, fmt.Sprintf("bearer %v", token.Bearer), r.Header.Get("authorization"))
+	}))
+	defer server.Close()
+
+	client := mockClient(server.URL)
+	client.Token = token
+	_, err := client.Push(n)
 	assert.NoError(t, err)
 }
 
@@ -232,4 +279,15 @@ func TestMalformedJSONResponse(t *testing.T) {
 	res, err := mockClient(server.URL).Push(n)
 	assert.Error(t, err)
 	assert.Equal(t, false, res.Sent())
+}
+
+func TestCloseIdleConnections(t *testing.T) {
+	transport := &mockTransport{}
+
+	client := mockClient("")
+	client.HTTPClient.Transport = transport
+
+	assert.Equal(t, false, transport.closed)
+	client.CloseIdleConnections()
+	assert.Equal(t, true, transport.closed)
 }
